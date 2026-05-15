@@ -77,8 +77,6 @@
 | `wikipedia` | Wikipedia | N/A | Search summaries for Concepts, Math, History, and Definitions. |
 | `github` | GitHub | `[YOUR_GITHUB_USERNAME]` | Fetch profiles, list repositories, and read/analyze source code. |
 | `huggingface` | HuggingFace | `[YOUR_HUGGINGFACE_USERNAME]` | Search models, datasets, and profiles on the HF Hub. |
-| `speak` | LuxTTS | N/A | Generate professional voiceovers (Follows strict Question Loop). |
-| `daily-brief` | Mixed | `[YOUR_GITHUB_USERNAME]` | Generate a text summary first, then a detailed audio script on request. |
 | `log` | Global Brain | N/A | Record atomic tasks to daily logs, retrieve logs, list history, delete old files. |
 | `brain-memory` | Global Brain | N/A | CRUD working notes inside `## 📝 Working Notes` of about/goals/settings/projects.md. |
 | `scratchpad` | Global Brain | N/A | Dedicated tool for temporary notes and mid-session context. |
@@ -90,9 +88,6 @@
 - **GitHub Tasks:** ALWAYS use the `github` tool. User: `[YOUR_GITHUB_USERNAME]`.
 - **AI/ML/Models:** ALWAYS use the `huggingface` tool. User: `[YOUR_HUGGINGFACE_USERNAME]`.
 - **Facts/Definitions:** ALWAYS use the `wikipedia` tool.
-- **Voice/Audio:** ALWAYS use the `speak` tool.
-- **Morning Summary:** ALWAYS use the `daily-brief` tool. **Show TEXT first.**
-- **Briefing Audio:** For `daily-brief` ONLY, use `philosopher-deep.mp3` at speed `0.6`.
 - **Log/History:** Use `log` for ALL daily tracking with actions (`write`, `read`, `list`, `entry-list`, `migrate`, `delete`). **DO NOT use `glob` or `list_dir` for history.**
 - **Working Notes / Short-term context:** Use `brain-memory` with the correct `target` (about/goals/settings/projects).
 - **Updating memory files:** ONLY via `brain-memory` tool. NEVER direct `edit` or `write`.
