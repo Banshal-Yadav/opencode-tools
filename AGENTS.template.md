@@ -83,6 +83,7 @@
 | `backup` | Global Brain | N/A | Backup/restore memory files before edits. Always call before touching memory files. |
 | `brain-memory` (bookmark) | Global Brain | N/A | Save ideas, links, prompts, things to try for later reference. |
 | `x-draft` | Local Brain | @[YOUR_Twitter_Handle] | Generate tweet/thread drafts from milestones. Saves to brain/drafts/. |
+| `music-player` | Local Brain | N/A | Terminal music player with mpv backend. Play local audio, download from YouTube via yt-dlp, manage playlists & favorites, control playback (pause/next/volume). |
 
 ### Tool Selection Guide:
 - **GitHub Tasks:** ALWAYS use the `github` tool. User: `[YOUR_GITHUB_USERNAME]`.
@@ -94,6 +95,7 @@
 - **Reading memory files** (about/goals/settings/projects/bookmark): ALWAYS use `brain-memory` with `action=read`. NEVER use `read` tool or shell commands directly on memory files.
 - **Reading drafts:** ALWAYS use `x-draft` with `action=read` or `action=list`. NEVER read draft files directly.
 - **Reading bookmarks:** ALWAYS use `brain-memory` with `action=read`, `target=bookmark`. NEVER read bookmark.md directly.
+- **Music Playback / Playlist / Download:** ALWAYS use the `music-player` tool. NEVER execute external media player commands or manually run node scripts/mpv.exe directly.
 
 ## Memory File Rules (CRITICAL)
 

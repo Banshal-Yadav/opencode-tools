@@ -20,7 +20,7 @@ const MPV_PIPE = "\\\\.\\pipe\\mpv-pipe";
 const AUDIO_EXTS = new Set([".mp3", ".flac", ".wav", ".m4a", ".ogg", ".opus", ".wma", ".aac"]);
 
 // Scoop install paths (fallback when PATH doesn't include them)
-const SCOOP_DIR = path.join(os.homedir(), "scoop");
+const SCOOP_DIR = process.env.SCOOP || path.join(os.homedir(), "scoop");
 const SCOOP_SHIMS = path.join(SCOOP_DIR, "shims");
 const SCOOP_APPS = path.join(SCOOP_DIR, "apps");
 
@@ -42,6 +42,7 @@ const FFPROBE_EXE = findExe("ffprobe");
 const FFPLAY_EXE = findExe("ffplay");
 
 let mpvProcess: ChildProcess | null = null;
+let mpvPid: number | null = null;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -95,6 +96,10 @@ function isAudioFile(name: string): boolean {
     return AUDIO_EXTS.has(ext);
 }
 
+function sanitizeFilename(name: string): string {
+    return name.replace(/[<>:"/\\|?*\x00-\x1f\uFFFD]/g, "").replace(/\s+/g, " ").trim();
+}
+
 function formatDuration(seconds: number): string {
     if (!seconds || seconds <= 0) return "?:??";
     const m = Math.floor(seconds / 60);
@@ -126,19 +131,43 @@ function findAudioFiles(dir: string, maxDepth: number = 5): string[] {
 }
 
 function readMetadata(filePath: string): { title: string; artist: string; duration: number } {
-    const name = path.basename(filePath, path.extname(filePath));
+    const basename = path.basename(filePath, path.extname(filePath));
+    let title = basename;
+    let artist = "Unknown";
+
+    const cleanText = (t: string) => {
+        return t
+            .replace(/\s*[\(\[][^\]\)]*(lyric|video|cover|audio|official|lyrics|full song)[^\]\)]*[\)\]]/gi, "")
+            .replace(/\s+/g, " ")
+            .trim();
+    };
+
+    // Attempt to split artist and title by common delimiters
+    const parts = basename.split(/\s+[-–—]\s+/);
+    if (parts.length >= 2) {
+        artist = parts[0].trim();
+        title = parts.slice(1).join(" - ").trim();
+    }
+
+    title = cleanText(title) || basename;
+    artist = cleanText(artist) || "Unknown";
+
     // Try ffprobe first
     try {
         const cmd = `"${FFPROBE_EXE}" -v quiet -print_format json -show_format "${filePath}"`;
         const out = execSync(cmd, { encoding: "utf8", timeout: 5000 });
         const data = JSON.parse(out);
         const fmt = data?.format || {};
-        const title = fmt?.tags?.title || name;
-        const artist = fmt?.tags?.artist || "Unknown";
+        const tagTitle = fmt?.tags?.title ? cleanText(fmt.tags.title) : "";
+        const tagArtist = fmt?.tags?.artist ? cleanText(fmt.tags.artist) : "";
+
+        if (tagTitle) title = tagTitle;
+        if (tagArtist && tagArtist.toLowerCase() !== "unknown") artist = tagArtist;
+
         const duration = parseFloat(fmt?.duration || "0");
         return { title, artist, duration };
     } catch {
-        return { title: name, artist: "Unknown", duration: 0 };
+        return { title, artist, duration: 0 };
     }
 }
 
@@ -149,31 +178,49 @@ function stopMpv(): void {
         try { mpvProcess.kill("SIGTERM"); } catch { /* ignore */ }
         mpvProcess = null;
     }
-    // Also kill any lingering mpv instances we spawned
-    try {
-        execSync("taskkill /F /IM mpv.exe /T 2>nul", { timeout: 2000 });
-    } catch { /* none running */ }
+    if (mpvPid !== null) {
+        try {
+            execSync(`taskkill /F /PID ${mpvPid} /T 2>nul`, { timeout: 2000 });
+        } catch { /* ignore */ }
+        mpvPid = null;
+    }
 }
 
 async function sendMpvCommand(command: any): Promise<string> {
-    return new Promise((resolve) => {
-        try {
-            const client = net.createConnection(MPV_PIPE, () => {
-                client.write(JSON.stringify({ command }) + "\n");
-            });
-            let data = "";
-            client.on("data", (chunk) => { data += chunk.toString(); });
-            client.on("end", () => resolve(data.trim()));
-            client.on("error", () => resolve(""));
-            client.setTimeout(3000, () => { client.destroy(); resolve(""); });
-        } catch {
-            resolve("");
+    const maxRetries = 5;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const result = await new Promise<string | null>((resolve) => {
+            try {
+                const client = net.createConnection(MPV_PIPE, () => {
+                    client.write(JSON.stringify({ command }) + "\n");
+                });
+                let data = "";
+                client.on("data", (chunk) => { data += chunk.toString(); });
+                client.on("end", () => resolve(data.trim()));
+                client.on("error", () => resolve(null));
+                client.setTimeout(1000, () => { client.destroy(); resolve(null); });
+            } catch {
+                resolve(null);
+            }
+        });
+        if (result !== null) return result;
+        if (attempt < maxRetries) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
         }
-    });
+    }
+    return "";
 }
 
 async function getMpvProperty(prop: string): Promise<string> {
-    return sendMpvCommand(["get_property", prop]);
+    const raw = await sendMpvCommand(["get_property", prop]);
+    if (!raw) return "";
+    try {
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.data !== undefined) {
+            return String(parsed.data);
+        }
+    } catch { /* ignore */ }
+    return "";
 }
 
 function startMpv(playlistPath: string, volume: number): void {
@@ -194,8 +241,11 @@ function startMpv(playlistPath: string, volume: number): void {
         stdio: ["ignore", "pipe", "pipe"],
     });
 
+    mpvPid = mpvProcess.pid || null;
+
     mpvProcess.on("exit", () => {
         mpvProcess = null;
+        mpvPid = null;
         const state = getState();
         state.playing = false;
         saveState(state);
@@ -203,6 +253,7 @@ function startMpv(playlistPath: string, volume: number): void {
 
     mpvProcess.on("error", () => {
         mpvProcess = null;
+        mpvPid = null;
     });
 }
 
@@ -242,8 +293,8 @@ function scanDirectory(dir: string): { added: number; songs: any[] } {
 
 // ─── Search ───────────────────────────────────────────────────────────────────
 
-function searchLibrary(query: string): any[] {
-    const lib = getLibrary();
+function searchLibrary(query: string, lib?: any[]): any[] {
+    if (!lib) lib = getLibrary();
     const q = query.toLowerCase();
     return lib.filter(
         (s: any) =>
@@ -263,7 +314,7 @@ export default tool({
             .enum([
                 "scan", "library", "play", "pause", "stop", "next", "prev",
                 "volume", "status", "download", "playlist", "favorite",
-                "shuffle", "check",
+                "shuffle", "check", "metadata", "queue", "remove",
             ])
             .default("status")
             .describe("Action to perform."),
@@ -287,6 +338,14 @@ export default tool({
             .number()
             .optional()
             .describe("Volume level 0-100."),
+        title: tool.schema
+            .string()
+            .optional()
+            .describe("New title for metadata action."),
+        artist: tool.schema
+            .string()
+            .optional()
+            .describe("New artist for metadata action."),
     },
 
     async execute(args) {
@@ -348,17 +407,27 @@ export default tool({
                     : "Library is empty. Use `scan` to add music or `download` to grab from YouTube.";
             }
 
-            const lines = lib.map((s: any, i: number) => {
+            const favorites = new Set(getFavorites().map((f: any) => f.path));
+
+            let output = args.query
+                ? `### 🔍 Search Results for '${args.query}' (${lib.length} songs):\n\n`
+                : `### 📚 Library (${lib.length} songs):\n\n`;
+
+            output += `| # | Title | Artist | Duration | Source | Fav |\n`;
+            output += `|---|-------|--------|----------|--------|-----|\n`;
+
+            lib.slice(0, 50).forEach((s: any, i: number) => {
+                const fav = favorites.has(s.path) ? "❤️" : "";
                 const dur = formatDuration(s.duration);
-                return `${i + 1}. ${s.title} — ${s.artist} [${dur}]`;
+                const source = s.path?.includes("downloads") ? "📥 YouTube" : "💻 Local";
+                output += `| ${i + 1} | **${s.title}** | ${s.artist} | ${dur} | ${source} | ${fav} |\n`;
             });
 
-            const header = args.query
-                ? `Found ${lib.length} song(s) for '${args.query}':\n`
-                : `Library (${lib.length} songs):\n`;
+            if (lib.length > 50) {
+                output += `\n...and ${lib.length - 50} more. Use a search query to narrow.`;
+            }
 
-            return header + lines.slice(0, 50).join("\n") +
-                (lib.length > 50 ? `\n...and ${lib.length - 50} more. Use a search to narrow.` : "");
+            return output;
         }
 
         // ── PLAY ──────────────────────────────────────────────────────────────
@@ -380,7 +449,33 @@ export default tool({
             else if (args.query) {
                 songs = searchLibrary(args.query);
                 if (songs.length === 0) {
-                    return `No songs found for '${args.query}'. Try \`download\` to grab it from YouTube first.`;
+                    // Auto-download: search YouTube and grab the first result
+                    try {
+                        const ffmpegDir = path.dirname(FFPROBE_EXE);
+                        const ytSearch = execSync(
+                            `"${YTDLP_EXE}" --flat-playlist --dump-single-json ytsearch:"${args.query}"`,
+                            { timeout: 15000, encoding: "utf8", shell: true }
+                        );
+                        const searchResult = JSON.parse(ytSearch);
+                        const firstUrl = searchResult?.entries?.[0]?.url || searchResult?.url || searchResult?.webpage_url;
+                        if (firstUrl) {
+                            const output = path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s");
+                            execSync(
+                                `"${YTDLP_EXE}" --extract-audio --audio-format mp3 --js-runtimes node --ffmpeg-location "${ffmpegDir}" --output "${output}" "${firstUrl}"`,
+                                { timeout: 120000, encoding: "utf8", shell: true }
+                            );
+                            const scanResult = scanDirectory(DOWNLOADS_DIR);
+                            songs = searchLibrary(args.query);
+                            if (songs.length > 0) {
+                                const msg = `⬇️ Auto-downloaded from YouTube. Playing now.`;
+                                // fall through to play
+                            }
+                        }
+                    } catch { /* auto-download failed, fall through to error */ }
+
+                    if (songs.length === 0) {
+                        return `No songs found for '${args.query}'. Try \`download [url]\` to grab it from YouTube.`;
+                    }
                 }
             }
             // Play all or specific path
@@ -400,7 +495,15 @@ export default tool({
                 }
             }
 
-            if (songs.length === 0) return "Nothing to play.";
+            // Verify file existence before playing
+            const missingCount = songs.length - songs.filter(s => fs.existsSync(s.path)).length;
+            songs = songs.filter(s => fs.existsSync(s.path));
+
+            if (songs.length === 0) {
+                return missingCount > 0
+                    ? `Error: The requested song file(s) could not be found on disk.`
+                    : "Nothing to play.";
+            }
 
             const filePaths = songs.map((s: any) => s.path);
             buildM3U(filePaths, CURRENT_M3U);
@@ -497,11 +600,22 @@ export default tool({
 
             // Try to get current time from mpv
             let timePos = "";
+            let progressBar = "";
             try {
-                const pos = await getMpvProperty("time-pos");
-                const dur = await getMpvProperty("duration");
-                if (pos && dur) {
-                    timePos = `${formatTime(parseFloat(pos))} / ${formatTime(parseFloat(dur))}`;
+                const posStr = await getMpvProperty("time-pos");
+                const durStr = await getMpvProperty("duration");
+                if (posStr && durStr) {
+                    const pos = parseFloat(posStr);
+                    const dur = parseFloat(durStr);
+                    if (!isNaN(pos) && !isNaN(dur) && dur > 0) {
+                        const percent = Math.round((pos / dur) * 100);
+                        const barLength = 20;
+                        const filledLength = Math.round(barLength * (pos / dur));
+                        const filled = "█".repeat(Math.max(0, Math.min(barLength, filledLength)));
+                        const empty = "░".repeat(Math.max(0, Math.min(barLength, barLength - filledLength)));
+                        progressBar = `\n   [${filled}${empty}] ${percent}%`;
+                        timePos = `${formatTime(pos)} / ${formatTime(dur)}`;
+                    }
                 }
             } catch { /* ignore */ }
 
@@ -512,7 +626,7 @@ export default tool({
             return [
                 `▶️ Now Playing:`,
                 `   ${current.title} — ${current.artist}`,
-                `   ${prog} | 🔊 ${state.volume}%`,
+                `   ${prog} | 🔊 ${state.volume}%${progressBar}`,
                 ``,
                 `Commands: pause | stop | next | prev | volume [0-100]`,
             ].join("\n");
@@ -522,28 +636,54 @@ export default tool({
         if (args.action === "download") {
             if (!args.url) return "Error: url is required for download.";
 
-            const output = path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s");
+            const isPlaylist = args.url.includes("list=");
+            const outputTemplate = isPlaylist
+                ? path.join(DOWNLOADS_DIR, "%(playlist_index)s - %(title)s.%(ext)s")
+                : path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s");
+
             try {
-                // Sanitize URL — remove tracking params that break shell
-                const cleanUrl = (args.url || "").split("&")[0];
                 const ffmpegDir = path.dirname(FFPROBE_EXE);
+                const dlArgs = [
+                    `"${YTDLP_EXE}"`,
+                    "--extract-audio",
+                    "--audio-format mp3",
+                    "--yes-playlist",
+                    "--embed-thumbnail",
+                    "--restrict-filenames",
+                    "--windows-filenames",
+                    "--no-overwrites",
+                    "--js-runtimes node",
+                    `--ffmpeg-location "${ffmpegDir}"`,
+                    `--output "${outputTemplate}"`,
+                    `"${args.url}"`,
+                ].join(" ");
+
                 const result = execSync(
-                    `"${YTDLP_EXE}" --extract-audio --audio-format mp3 --js-runtimes node --ffmpeg-location "${ffmpegDir}" --output "${output}" "${cleanUrl}"`,
-                    { timeout: 300000, encoding: "utf8", maxBuffer: 10 * 1024 * 1024, shell: true }
+                    dlArgs,
+                    { timeout: 600000, encoding: "utf8", maxBuffer: 10 * 1024 * 1024, shell: true }
                 );
 
                 // Scan downloads dir to add new songs to library
-                const scanResult = scanDirectory(DOWNLOADS_DIR);
+                const beforeCount = getLibrary().length;
+                scanDirectory(DOWNLOADS_DIR);
+                const afterCount = getLibrary().length;
+                const newSongs = afterCount - beforeCount;
 
-                // Extract the downloaded filename from yt-dlp output
-                const match = result.match(/Destination:\s*(.+\.mp3)/i);
-                const filename = match ? path.basename(match[1]) : "unknown";
+                // Extract downloaded filenames from yt-dlp output
+                const matches = [...result.matchAll(/\[ExtractAudio\] Destination:\s*(.+\.mp3)/gi)];
+                const names = matches.map((m) => path.basename(m[1]));
 
-                return [
-                    `✅ Downloaded: ${filename}`,
-                    `📚 Library now has ${scanResult.songs.length} songs`,
-                    `▶️ Try: \`play "${path.basename(filename, ".mp3")}"\``,
-                ].join("\n");
+                const lines = [`✅ Downloaded ${newSongs} new song(s)`];
+                if (names.length <= 5) {
+                    names.forEach((n) => lines.push(`   • ${n}`));
+                } else {
+                    lines.push(`   • ${names[0]}`);
+                    lines.push(`   • ${names[1]}`);
+                    lines.push(`   • ...and ${names.length - 2} more`);
+                }
+                lines.push(`📚 Library now has ${afterCount} songs`);
+                return lines.join("\n");
+
             } catch (err: any) {
                 return `Error downloading: ${err.message || "unknown error"}`;
             }
@@ -581,9 +721,9 @@ export default tool({
                 return `▶️ Playing playlist '${plName}' (${songs.length} songs). Now: ${songs[0].title}`;
             }
 
-            // create [name]
-            if (subAction.startsWith("create ")) {
-                const plName = subAction.replace(/^create\s*/i, "").trim();
+            // create / save [name]
+            if (subAction.startsWith("create ") || subAction.startsWith("save ")) {
+                const plName = subAction.replace(/^(create|save)\s*/i, "").trim();
                 if (!plName) return "Error: provide a playlist name. Usage: `playlist create my-list`";
                 const state = getState();
                 const songs = state.queue && state.queue.length > 0
@@ -640,6 +780,18 @@ export default tool({
 
         // ── FAVORITE ──────────────────────────────────────────────────────────
         if (args.action === "favorite") {
+            const favs = getFavorites();
+
+            // List favorites
+            if (args.query === "list") {
+                if (favs.length === 0) return "💔 No favorites yet. Use `favorite` while a song plays or `favorite \"song name\"`.";
+                const lines = favs.map((s: any, i: number) => {
+                    const dur = formatDuration(s.duration);
+                    return `  ${i + 1}. ${s.title}\n     Artist: ${s.artist}  |  ${dur}`;
+                });
+                return `❤️ **Favorites (${favs.length} songs)**\n${lines.join("\n\n")}`;
+            }
+
             let song: any = null;
 
             if (args.query) {
@@ -652,7 +804,6 @@ export default tool({
                 song = state.current;
             }
 
-            const favs = getFavorites();
             const alreadyFav = favs.some((f: any) => f.path === song.path);
 
             if (alreadyFav) {
@@ -668,10 +819,26 @@ export default tool({
 
         // ── SHUFFLE ───────────────────────────────────────────────────────────
         if (args.action === "shuffle") {
-            const lib = getLibrary();
-            if (lib.length === 0) return "Library is empty.";
+            let pool: any[] = [];
 
-            const shuffled = [...lib].sort(() => Math.random() - 0.5);
+            if (args.query === "favorites" || args.query === "favs") {
+                pool = getFavorites();
+                if (pool.length === 0) return "💔 No favorites to shuffle. Add some favorites first.";
+            } else if (args.query) {
+                const plFile = path.join(PLAYLISTS_DIR, `${args.query}.json`);
+                if (fs.existsSync(plFile)) {
+                    pool = readJSON(plFile, []);
+                    if (pool.length === 0) return `Playlist '${args.query}' is empty.`;
+                } else {
+                    pool = searchLibrary(args.query);
+                    if (pool.length === 0) return `No songs found for '${args.query}'.`;
+                }
+            } else {
+                pool = getLibrary();
+                if (pool.length === 0) return "Library is empty.";
+            }
+
+            const shuffled = [...pool].sort(() => Math.random() - 0.5);
             const filePaths = shuffled.map((s: any) => s.path);
             buildM3U(filePaths, CURRENT_M3U);
 
@@ -686,6 +853,133 @@ export default tool({
             return `🔀 Shuffling ${shuffled.length} songs. Now: ${shuffled[0].title} — ${shuffled[0].artist}`;
         }
 
-        return `Unknown action '${args.action}'. Available: scan, library, play, pause, stop, next, prev, volume, status, download, playlist, favorite, shuffle, check`;
+        // ── QUEUE ──────────────────────────────────────────────────────────────
+        if (args.action === "queue") {
+            // ── Add to queue ──
+            if (args.query) {
+                const lib = getLibrary();
+                const results = searchLibrary(args.query, lib);
+                if (results.length === 0) return `No songs found for '${args.query}'.`;
+
+                const state = getState();
+                if (!state.queue) state.queue = [];
+
+                for (const song of results) {
+                    state.queue.push(song.path);
+                    // Append to mpv's running playlist if playing
+                    if (state.playing) {
+                        await sendMpvCommand(["loadfile", song.path, "append"]);
+                    }
+                }
+
+                // If nothing playing, start from the first queued song
+                if (!state.playing) {
+                    const firstInLib = lib.find((s: any) => s.path === state.queue[0]);
+                    state.current = firstInLib || results[0];
+                    state.playing = true;
+                    state.position = 0;
+                    saveState(state);
+                    buildM3U(state.queue, CURRENT_M3U);
+                    startMpv(CURRENT_M3U, state.volume || 50);
+                } else {
+                    saveState(state);
+                }
+
+                const first = results[0];
+                const dur = formatDuration(first.duration);
+                return results.length === 1
+                    ? `➕ Queued: ${first.title} — ${first.artist} [${dur}]`
+                    : `➕ Queued ${results.length} songs:\n   ${results.map((s: any) => `${s.title} — ${s.artist}`).join("\n   ")}`;
+            }
+
+            // ── Show queue ──
+            const state = getState();
+            if (!state.queue || state.queue.length === 0) return "Queue is empty. Play something first.";
+
+            const lib = getLibrary();
+            const lines = state.queue.map((p: string, i: number) => {
+                const song = lib.find((s: any) => s.path === p);
+                const nowPlaying = i === 0 && state.playing ? "▶️ " : "   ";
+                if (song) {
+                    return `${nowPlaying}${i + 1}. ${song.title} — ${song.artist} [${formatDuration(song.duration)}]`;
+                }
+                return `${nowPlaying}${i + 1}. ${path.basename(p, path.extname(p))}`;
+            });
+
+            const header = state.playing
+                ? `📋 Queue (${state.queue.length} songs) — currently playing #1\n`
+                : `📋 Queue (${state.queue.length} songs)\n`;
+            return header + lines.join("\n");
+        }
+
+        // ── METADATA ───────────────────────────────────────────────────────────
+        if (args.action === "metadata") {
+            if (!args.query) return "Error: specify a song to edit. Usage: `metadata \"song name\" title=\"New Title\" artist=\"New Artist\"`";
+            if (!args.title && !args.artist) return "Error: provide at least `title` or `artist` to update.";
+
+            const lib = getLibrary();
+            const results = searchLibrary(args.query, lib);
+            if (results.length === 0) return `No songs found for '${args.query}'.`;
+
+            const song = results[0];
+            const changes: string[] = [];
+            if (args.title) { song.title = args.title; changes.push(`title → "${args.title}"`); }
+            if (args.artist) { song.artist = args.artist; changes.push(`artist → "${args.artist}"`); }
+
+            saveLibrary(lib);
+
+            // Also update favorites if present
+            const favs = getFavorites();
+            const favIdx = favs.findIndex((f: any) => f.path === song.path);
+            if (favIdx >= 0) {
+                if (args.title) favs[favIdx].title = args.title;
+                if (args.artist) favs[favIdx].artist = args.artist;
+                saveFavorites(favs);
+            }
+
+            return `✅ Updated metadata for "${song.title}":\n   ${changes.join("\n   ")}`;
+        }
+
+        // ── REMOVE ─────────────────────────────────────────────────────────────
+        if (args.action === "remove") {
+            if (!args.query) return "Error: specify a song to remove. Usage: `remove \"song name\"`.";
+
+            const lib = getLibrary();
+            const results = searchLibrary(args.query, lib);
+            if (results.length === 0) return `No songs found for '${args.query}'.`;
+
+            const song = results[0];
+            const wasFavorite = getFavorites().some((f: any) => f.path === song.path);
+
+            // Delete file
+            let fileDeleted = false;
+            try {
+                if (fs.existsSync(song.path)) {
+                    fs.unlinkSync(song.path);
+                    fileDeleted = true;
+                }
+            } catch { /* file may be in use */ }
+
+            // Remove from library
+            const filtered = lib.filter((s: any) => s.path !== song.path);
+            saveLibrary(filtered);
+
+            // Remove from favorites
+            if (wasFavorite) {
+                const favs = getFavorites().filter((f: any) => f.path !== song.path);
+                saveFavorites(favs);
+            }
+
+            const lines = [
+                `🗑️ Removed: ${song.title} — ${song.artist}`,
+                fileDeleted ? "   🗑️ File deleted" : "   ⚠️ File not found (library entry removed)",
+                wasFavorite ? "   💔 Removed from favorites" : "",
+                `📚 Library now has ${filtered.length} songs`,
+            ].filter(Boolean);
+
+            return lines.join("\n");
+        }
+
+        return `Unknown action '${args.action}'. Available: scan, library, play, pause, stop, next, prev, volume, status, download, playlist, favorite, shuffle, check, metadata, queue, remove`;
     },
 });
