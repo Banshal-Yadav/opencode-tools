@@ -22,7 +22,13 @@ These tools turn a stateless AI into a persistent collaborator by maintaining a 
 │   ├── memory/          <-- Permanent .md files (about.md, goals.md, projects.md)
 │   ├── logs/            <-- Daily timestamped logs
 │   ├── drafts/          <-- X/Social media drafts
-│   └── backups/         <-- Automated safety snapshots
+│   ├── backups/         <-- Automated safety snapshots
+│   └── music/           <-- Music library (music-player tool)
+│       ├── state.json         <-- Current playback state
+│       ├── library.json       <-- Indexed song library
+│       ├── favorites.json     <-- Liked songs
+│       ├── downloads/         <-- Songs downloaded via yt-dlp
+│       └── playlists/         <-- Saved playlists
 ```
 
 ### 3. Tool Configuration
@@ -51,6 +57,23 @@ Copy the provided `.ts` files into your OpenCode tools directory.
 | **huggingface** | Explores models and datasets on the HF Hub. |
 | **wikipedia** | Quick factual lookups for concepts and history. |
 | **x-draft** | Drafts dev-tweets and threads from your work. |
+| **music-player** | Terminal music player with mpv backend. Play local audio, download from YouTube via yt-dlp, manage playlists & favorites, full playback control (pause/next/volume) from chat. |
+
+## 🎵 Music Player Dependencies
+
+The `music-player` tool requires these external binaries (install via [scoop](https://scoop.sh)):
+
+```powershell
+scoop install mpv yt-dlp ffmpeg
+```
+
+| Binary | Purpose | Install check |
+|--------|---------|---------------|
+| **mpv** | Audio playback engine with IPC support | `mpv --version` |
+| **yt-dlp** | Download audio from YouTube/SoundCloud | `yt-dlp --version` |
+| **ffmpeg/ffprobe** | Audio metadata extraction (title, artist, duration) | `ffprobe -version` |
+
+The tool auto-detects scoop install paths (`~/scoop/apps/` and `~/scoop/shims/`) and falls back to system PATH.
 
 ## 🛡️ Privacy & Security
 - **Local First:** All memory, logs, and drafts are stored locally as plain `.md` files.
