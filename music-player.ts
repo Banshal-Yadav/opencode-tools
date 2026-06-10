@@ -2,7 +2,7 @@ import { tool } from "@opencode-ai/plugin";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { spawn, ChildProcess, execSync } from "child_process";
+import { spawn, ChildProcess, execSync, exec } from "child_process";
 import * as net from "net";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -16,7 +16,9 @@ const PLAYLISTS_DIR = path.join(MUSIC_DIR, "playlists");
 const DOWNLOADS_DIR = path.join(MUSIC_DIR, "downloads");
 const CURRENT_M3U = path.join(MUSIC_DIR, "current.m3u");
 
-const MPV_PIPE = "\\\\.\\pipe\\mpv-pipe";
+const MPV_PIPE = process.platform === "win32"
+    ? "\\\\.\\pipe\\mpv-pipe"
+    : path.join(MUSIC_DIR, "mpv.sock");
 const AUDIO_EXTS = new Set([".mp3", ".flac", ".wav", ".m4a", ".ogg", ".opus", ".wma", ".aac"]);
 
 // Scoop install paths (fallback when PATH doesn't include them)
@@ -32,6 +34,14 @@ function findExe(name: string): string {
     const appDir = path.join(SCOOP_APPS, name, "current");
     const exePath = path.join(appDir, `${name}.exe`);
     if (fs.existsSync(exePath)) return exePath;
+    // Try PATH lookup (Windows: where, others: which)
+    try {
+        const cmd = process.platform === "win32" ? `where ${name}` : `which ${name}`;
+        const out = execSync(cmd, { encoding: "utf8", stdio: "pipe" }).trim();
+        const first = out.split(/\r?\n/)[0];
+        if (first) return first.trim();
+    } catch { /* ignore */ }
+
     // Fallback to bare name (relies on PATH)
     return name;
 }
@@ -68,7 +78,7 @@ function writeJSON(file: string, data: any): void {
 }
 
 function getState(): any {
-    return readJSON(STATE_FILE, { current: null, queue: [], position: 0, volume: 50, playing: false });
+    return readJSON(STATE_FILE, { current: null, queue: [], position: 0, volume: 50, playing: false, lastPositions: {} });
 }
 
 function saveState(state: any): void {
@@ -111,22 +121,23 @@ function formatTime(seconds: number): string {
     return formatDuration(seconds);
 }
 
-function findAudioFiles(dir: string, maxDepth: number = 5): string[] {
+async function findAudioFiles(dir: string, maxDepth: number = 5): Promise<string[]> {
     const results: string[] = [];
-    function walk(current: string, depth: number): void {
+    async function walk(current: string, depth: number): Promise<void> {
         if (depth > maxDepth) return;
         try {
-            for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+            const entries = await fs.promises.readdir(current, { withFileTypes: true });
+            for (const entry of entries) {
                 const full = path.join(current, entry.name);
                 if (entry.isDirectory()) {
-                    walk(full, depth + 1);
+                    await walk(full, depth + 1);
                 } else if (entry.isFile() && isAudioFile(entry.name)) {
                     results.push(full);
                 }
             }
         } catch { /* skip unreadable dirs */ }
     }
-    if (fs.existsSync(dir)) walk(dir, 0);
+    if (fs.existsSync(dir)) await walk(dir, 0);
     return results;
 }
 
@@ -169,6 +180,29 @@ function readMetadata(filePath: string): { title: string; artist: string; durati
     } catch {
         return { title, artist, duration: 0 };
     }
+}
+
+function getFfmpegLocationArg(): string | null {
+    try {
+        if (fs.existsSync(FFPROBE_EXE)) {
+            const dir = path.dirname(FFPROBE_EXE);
+            if (dir && dir !== ".") return dir;
+        }
+    } catch { /* ignore */ }
+    return null;
+}
+
+function execCommand(command: string, options: any): Promise<string> {
+    return new Promise((resolve, reject) => {
+        exec(command, options, (error, stdout, stderr) => {
+            if (error) {
+                const msg = (stderr || "").toString().trim() || error.message;
+                reject(new Error(msg));
+                return;
+            }
+            resolve((stdout || "").toString());
+        });
+    });
 }
 
 // ─── mpv Control ──────────────────────────────────────────────────────────────
@@ -223,18 +257,43 @@ async function getMpvProperty(prop: string): Promise<string> {
     return "";
 }
 
-function startMpv(playlistPath: string, volume: number): void {
+async function capturePlaybackPosition(state: any): Promise<void> {
+    try {
+        const pathValue = await getMpvProperty("path");
+        const posStr = await getMpvProperty("time-pos");
+        const pos = parseFloat(posStr);
+        if (!isNaN(pos) && pos >= 0) {
+            state.position = pos;
+            if (pathValue) {
+                if (!state.lastPositions) state.lastPositions = {};
+                state.lastPositions[pathValue] = pos;
+                const lib = getLibrary();
+                const match = lib.find((s: any) => s.path === pathValue);
+                if (match) state.current = match;
+            }
+        }
+    } catch { /* ignore */ }
+}
+
+function startMpv(playlistPath: string, volume: number, startSeconds?: number): void {
     stopMpv();
+
+    if (process.platform !== "win32") {
+        try {
+            if (fs.existsSync(MPV_PIPE)) fs.unlinkSync(MPV_PIPE);
+        } catch { /* ignore */ }
+    }
 
     const args = [
         "--no-video",
         `--volume=${volume}`,
         `--input-ipc-server=${MPV_PIPE}`,
         `--playlist=${playlistPath}`,
+        startSeconds !== undefined && startSeconds > 0 ? `--start=${Math.floor(startSeconds)}` : "",
         "--keep-open=no",
         "--term-status-msg=",
         "--really-quiet",
-    ];
+    ].filter(Boolean);
 
     mpvProcess = spawn(MPV_EXE, args, {
         detached: false,
@@ -266,8 +325,8 @@ function buildM3U(files: string[], outputPath: string): void {
 
 // ─── Library Scanning ─────────────────────────────────────────────────────────
 
-function scanDirectory(dir: string): { added: number; songs: any[] } {
-    const files = findAudioFiles(dir);
+async function scanDirectory(dir: string): Promise<{ added: number; songs: any[] }> {
+    const files = await findAudioFiles(dir);
     const existing = getLibrary();
     const existingPaths = new Set(existing.map((s: any) => s.path));
     let added = 0;
@@ -394,7 +453,7 @@ export default tool({
             if (!fs.existsSync(scanPath)) {
                 return `Error: path '${scanPath}' does not exist.`;
             }
-            const result = scanDirectory(scanPath);
+            const result = await scanDirectory(scanPath);
             return `Scanned ${scanPath}\nAdded ${result.added} new songs\nLibrary now has ${result.songs.length} songs`;
         }
 
@@ -434,6 +493,9 @@ export default tool({
         if (args.action === "play") {
             const state = getState();
             let songs: any[] = [];
+            const resumePosition = !args.name && !args.query && !args.path && state.current && state.playing === false
+                ? (state.lastPositions?.[state.current.path] ?? state.position)
+                : 0;
 
             // Play by playlist name
             if (args.name) {
@@ -451,8 +513,8 @@ export default tool({
                 if (songs.length === 0) {
                     // Auto-download: search YouTube and grab the first result
                     try {
-                        const ffmpegDir = path.dirname(FFPROBE_EXE);
-                        const ytSearch = execSync(
+                        const ffmpegDir = getFfmpegLocationArg();
+                        const ytSearch = await execCommand(
                             `"${YTDLP_EXE}" --flat-playlist --dump-single-json ytsearch:"${args.query}"`,
                             { timeout: 15000, encoding: "utf8", shell: true }
                         );
@@ -460,11 +522,17 @@ export default tool({
                         const firstUrl = searchResult?.entries?.[0]?.url || searchResult?.url || searchResult?.webpage_url;
                         if (firstUrl) {
                             const output = path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s");
-                            execSync(
-                                `"${YTDLP_EXE}" --extract-audio --audio-format mp3 --js-runtimes node --ffmpeg-location "${ffmpegDir}" --output "${output}" "${firstUrl}"`,
-                                { timeout: 120000, encoding: "utf8", shell: true }
-                            );
-                            const scanResult = scanDirectory(DOWNLOADS_DIR);
+                            const dlArgs = [
+                                `"${YTDLP_EXE}"`,
+                                "--extract-audio",
+                                "--audio-format mp3",
+                                "--js-runtimes node",
+                                ffmpegDir ? `--ffmpeg-location "${ffmpegDir}"` : "",
+                                `--output "${output}"`,
+                                `"${firstUrl}"`,
+                            ].filter(Boolean).join(" ");
+                            await execCommand(dlArgs, { timeout: 120000, encoding: "utf8", shell: true });
+                            const scanResult = await scanDirectory(DOWNLOADS_DIR);
                             songs = searchLibrary(args.query);
                             if (songs.length > 0) {
                                 const msg = `⬇️ Auto-downloaded from YouTube. Playing now.`;
@@ -515,7 +583,14 @@ export default tool({
             state.volume = state.volume || 50;
             saveState(state);
 
-            startMpv(CURRENT_M3U, state.volume);
+            startMpv(CURRENT_M3U, state.volume, resumePosition || undefined);
+
+            if (resumePosition && resumePosition > 0) {
+                await new Promise((resolve) => setTimeout(resolve, 300));
+                await sendMpvCommand(["set_property", "time-pos", resumePosition]);
+                state.position = resumePosition;
+                saveState(state);
+            }
 
             const first = songs[0];
             const dur = formatDuration(first.duration);
@@ -539,6 +614,7 @@ export default tool({
                     ? `▶️ Resumed: ${current.title} — ${current.artist}`
                     : "▶️ Resumed";
             } else {
+                await capturePlaybackPosition(state);
                 await sendMpvCommand(["set_property", "pause", true]);
                 state.playing = false;
                 saveState(state);
@@ -551,8 +627,9 @@ export default tool({
 
         // ── STOP ──────────────────────────────────────────────────────────────
         if (args.action === "stop") {
-            stopMpv();
             const state = getState();
+            await capturePlaybackPosition(state);
+            stopMpv();
             state.playing = false;
             saveState(state);
             return "⏹️ Stopped.";
@@ -588,6 +665,11 @@ export default tool({
         // ── STATUS ────────────────────────────────────────────────────────────
         if (args.action === "status") {
             const state = getState();
+
+            if (state.playing) {
+                await capturePlaybackPosition(state);
+                saveState(state);
+            }
 
             if (!state.current || !state.playing) {
                 const lib = getLibrary();
@@ -642,7 +724,7 @@ export default tool({
                 : path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s");
 
             try {
-                const ffmpegDir = path.dirname(FFPROBE_EXE);
+                const ffmpegDir = getFfmpegLocationArg();
                 const dlArgs = [
                     `"${YTDLP_EXE}"`,
                     "--extract-audio",
@@ -653,19 +735,19 @@ export default tool({
                     "--windows-filenames",
                     "--no-overwrites",
                     "--js-runtimes node",
-                    `--ffmpeg-location "${ffmpegDir}"`,
+                    ffmpegDir ? `--ffmpeg-location "${ffmpegDir}"` : "",
                     `--output "${outputTemplate}"`,
                     `"${args.url}"`,
-                ].join(" ");
+                ].filter(Boolean).join(" ");
 
-                const result = execSync(
+                const result = await execCommand(
                     dlArgs,
                     { timeout: 600000, encoding: "utf8", maxBuffer: 10 * 1024 * 1024, shell: true }
                 );
 
                 // Scan downloads dir to add new songs to library
                 const beforeCount = getLibrary().length;
-                scanDirectory(DOWNLOADS_DIR);
+                await scanDirectory(DOWNLOADS_DIR);
                 const afterCount = getLibrary().length;
                 const newSongs = afterCount - beforeCount;
 
