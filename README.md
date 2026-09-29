@@ -79,6 +79,18 @@ The tool auto-detects scoop install paths (`~/scoop/apps/` and `~/scoop/shims/`)
 - **Local First:** All memory, logs, and drafts are stored locally as plain `.md` files.
 - **No Cloud Required:** None of your personal data leaves your machine.
 
+## 🧪 Testing & Verification
+
+A local test harness and TypeScript verification suite are included to ensure backward compatibility and catch edge cases:
+
+```bash
+# Run TypeScript compilation check across all tool files
+npm run typecheck
+
+# Run full automated test suite (29 tests covering edge cases & brain data formats)
+npm test
+```
+
 ## 🤝 Contributing
 Have a tool you've built for OpenCode? PRs welcome. Submit your `.ts` tool file with a brief description and it'll be added to the suite.
 
