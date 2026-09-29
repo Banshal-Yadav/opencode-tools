@@ -22,11 +22,15 @@ function getTodayDate(): string {
 function buildEntryId(date: string): string {
   const compact = new Date().toISOString().replace(/[-:.TZ]/g, "");
   const random = Math.random().toString(36).slice(2, 6);
-  return `${date}-${compact}-${random}`;
+  return `sp-${date}-${compact}-${random}`;
 }
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeEol(value: string): string {
+  return value.replace(/\r\n/g, "\n");
 }
 
 function ensureScratchFile(): string {
@@ -35,7 +39,7 @@ function ensureScratchFile(): string {
   if (!fs.existsSync(SCRATCH_FILE)) {
     fs.writeFileSync(SCRATCH_FILE, `# 📝 Scratch Pad — Temporary Notes\n\n${WORKING_NOTES_SECTION}\n\n---\n\n`, "utf8");
   }
-  let content = fs.readFileSync(SCRATCH_FILE, "utf8");
+  let content = normalizeEol(fs.readFileSync(SCRATCH_FILE, "utf8"));
   if (!content.includes(WORKING_NOTES_SECTION)) {
     content = content.trimEnd() + "\n\n" + WORKING_NOTES_SECTION + "\n\n---\n\n";
     fs.writeFileSync(SCRATCH_FILE, content, "utf8");
@@ -45,9 +49,38 @@ function ensureScratchFile(): string {
 
 function extractWorkingNotesBlock(content: string) {
   const sectionIndex = content.indexOf(WORKING_NOTES_SECTION);
+  if (sectionIndex === -1) {
+    return { before: content, section: WORKING_NOTES_SECTION + "\n\n", after: "" };
+  }
   const afterHeader = content.slice(sectionIndex + WORKING_NOTES_SECTION.length);
-  const nextSectionMatch = afterHeader.match(/\n## /);
-  const nextSectionOffset = nextSectionMatch ? afterHeader.indexOf(nextSectionMatch[0]) : afterHeader.length;
+
+  const lines = afterHeader.split("\n");
+  let inEntry = false;
+  let nextSectionOffset = afterHeader.length;
+  let offset = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineOffset = offset;
+    offset += line.length + 1;
+
+    if (/^### \[[^\]]+\] \d{4}-\d{2}-\d{2} \| ID:/.test(line)) {
+      inEntry = true;
+      continue;
+    }
+
+    if (inEntry) {
+      if (line.trim() === "---") {
+        inEntry = false;
+      }
+      continue;
+    }
+
+    if (/^## (?!#)/.test(line) && i > 0) {
+      nextSectionOffset = lineOffset;
+      break;
+    }
+  }
 
   return {
     before: content.slice(0, sectionIndex),
@@ -57,16 +90,19 @@ function extractWorkingNotesBlock(content: string) {
 }
 
 function listEntries(sectionContent: string) {
-  const entryPattern = /### \[([^\]]+)\] (\d{4}-\d{2}-\d{2}) \| ID: ([^\n]+)\n([\s\S]*?)(?:\n---\n|$)/g;
-  const entries: any[] = [];
-  let match;
-  while ((match = entryPattern.exec(sectionContent)) !== null) {
-    entries.push({
-      time: match[1].trim(),
-      date: match[2].trim(),
-      id: match[3].trim(),
-      content: match[4].trim(),
-    });
+  const blocks = sectionContent.split(/(?=^### \[[^\]]+\] \d{4}-\d{2}-\d{2} \| ID:)/m);
+  const entries: Array<{ time: string; date: string; id: string; content: string }> = [];
+  for (const block of blocks) {
+    const match = block.match(/^### \[([^\]]+)\] (\d{4}-\d{2}-\d{2}) \| ID: ([^\n\r]+)\r?\n([\s\S]*)$/);
+    if (match) {
+      const body = match[4].replace(/\s*---\s*$/, "").trim();
+      entries.push({
+        time: match[1].trim(),
+        date: match[2].trim(),
+        id: match[3].trim(),
+        content: body,
+      });
+    }
   }
   return entries;
 }
@@ -81,9 +117,9 @@ export default tool({
     content: tool.schema.string().optional().describe("Note content for create/modify."),
     id: tool.schema.string().optional().describe("Entry ID for read/modify/delete."),
   },
-  async execute(args: any) {
+  async execute(args) {
     ensureScratchFile();
-    const content = fs.readFileSync(SCRATCH_FILE, "utf8");
+    const content = normalizeEol(fs.readFileSync(SCRATCH_FILE, "utf8"));
     const { before, section, after } = extractWorkingNotesBlock(content);
     const entries = listEntries(section);
 
@@ -119,16 +155,16 @@ export default tool({
       return `[${found.time}] ${found.date} | ID: ${found.id}\n${found.content}`;
     }
 
-    // MODIFY — update checkpoint in place, preserves ID and timestamp header
+    // MODIFY
     if (args.action === "modify") {
       if (!args.id) return "Error: id required for modify.";
       if (!args.content) return "Error: content required for modify.";
       const target = entries.find(e => e.id === args.id);
-      if (!target) return `Note ${args.id} not found in scratchpad.`;
+      if (!target) return `Error: could not locate entry ${args.id} for update.`;
 
       const escapedId = escapeRegExp(target.id);
       const entryPattern = new RegExp(
-        `(### \\[[^\\]]+\\] \\d{4}-\\d{2}-\\d{2} \\| ID: ${escapedId}\\n)([\\s\\S]*?)(\\n---\\n)`,
+        `^### \\[[^\\]]+\\] ${escapeRegExp(target.date)} \\| ID: ${escapedId}\\r?\\n[\\s\\S]*?(?=^### \\[|$)`,
         "m"
       );
 
@@ -136,12 +172,8 @@ export default tool({
         return `Error: could not locate entry ${args.id} for update.`;
       }
 
-      // Append [updated HH:MM:SS] marker to header so history is traceable
-      const updatedSection = section.replace(
-        entryPattern,
-        (_full: string, header: string, _body: string, sep: string) =>
-          `${header.trimEnd()} [updated ${getClockTime()}]\n${args.content.trim()}${sep}`
-      );
+      const updatedEntry = `### [${target.time}] ${target.date} | ID: ${target.id}\n${args.content.trim()}\n\n---\n\n`;
+      const updatedSection = section.replace(entryPattern, updatedEntry);
 
       fs.writeFileSync(SCRATCH_FILE, before + updatedSection + after, "utf8");
       return `Checkpoint ${args.id} updated.`;
@@ -150,11 +182,15 @@ export default tool({
     // DELETE
     if (args.action === "delete") {
       if (!args.id) return "Error: id required.";
-      const escapedId = escapeRegExp(args.id);
+      const target = entries.find(e => e.id === args.id);
+      if (!target) return `Note ${args.id} not found.`;
+
+      const escapedId = escapeRegExp(target.id);
       const pattern = new RegExp(
-        `### \\[[^\\]]+\\] \\d{4}-\\d{2}-\\d{2} \\| ID: ${escapedId}\\n[\\s\\S]*?\\n---\\n\\n?`,
+        `^### \\[[^\\]]+\\] ${escapeRegExp(target.date)} \\| ID: ${escapedId}\\r?\\n[\\s\\S]*?(?=^### \\[|$)`,
         "m"
       );
+
       const updatedSection = section.replace(pattern, "");
       fs.writeFileSync(SCRATCH_FILE, before + updatedSection + after, "utf8");
       return `Deleted note ${args.id}.`;

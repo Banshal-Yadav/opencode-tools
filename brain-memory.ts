@@ -49,6 +49,13 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// Normalize line endings on read so entry parsing works for both LF and CRLF
+// files (Windows-authored memory files are commonly CRLF). Writes standardize
+// on LF, which is what this tool already produced.
+function normalizeEol(value: string): string {
+  return value.replace(/\r\n/g, "\n");
+}
+
 function ensureDir(dirPath: string): void {
   if (!fs.existsSync(dirPath)) {
     fs.mkdirSync(dirPath, { recursive: true });
@@ -71,13 +78,14 @@ function ensureWorkingNotesSection(filePath: string): string {
   } else if (!fs.existsSync(filePath)) {
     throw new Error(`Memory file not found: ${filePath}. Do not auto-create memory files — inform the user.`);
   }
-  let content = fs.readFileSync(filePath, "utf8");
+  let content = normalizeEol(fs.readFileSync(filePath, "utf8"));
   if (!content.includes(WORKING_NOTES_SECTION)) {
     const separator = content.endsWith("\n\n") ? "" : content.endsWith("\n") ? "\n" : "\n\n";
     content = content + separator + WORKING_NOTES_SECTION + "\n\n";
     safeWrite(filePath, content);
   }
-  return fs.readFileSync(filePath, "utf8");
+  // Return the in-memory content (avoid a redundant re-read).
+  return content;
 }
 
 function extractWorkingNotesBlock(content: string): { before: string; section: string; after: string } {
@@ -86,8 +94,34 @@ function extractWorkingNotesBlock(content: string): { before: string; section: s
     return { before: content, section: WORKING_NOTES_SECTION + "\n\n", after: "" };
   }
   const afterHeader = content.slice(sectionIndex + WORKING_NOTES_SECTION.length);
-  const nextSectionMatch = afterHeader.match(/\n## /);
-  const nextSectionOffset = nextSectionMatch ? afterHeader.indexOf(nextSectionMatch[0]) : afterHeader.length;
+
+  const lines = afterHeader.split("\n");
+  let inEntry = false;
+  let nextSectionOffset = afterHeader.length;
+  let offset = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineOffset = offset;
+    offset += line.length + 1;
+
+    if (/^### \[[^\]]+\] \d{4}-\d{2}-\d{2} \| ID:/.test(line)) {
+      inEntry = true;
+      continue;
+    }
+
+    if (inEntry) {
+      if (line.trim() === "---") {
+        inEntry = false;
+      }
+      continue;
+    }
+
+    if (/^## (?!#)/.test(line) && i > 0) {
+      nextSectionOffset = lineOffset;
+      break;
+    }
+  }
 
   return {
     before: content.slice(0, sectionIndex),
@@ -96,34 +130,41 @@ function extractWorkingNotesBlock(content: string): { before: string; section: s
   };
 }
 
-function buildEntry(date: string, id: string, content: string): string {
-  return `### [${getClockTime()}] ${date} | ID: ${id}\n${content.trim()}\n\n---\n\n`;
+function buildEntry(date: string, id: string, content: string, time: string = getClockTime()): string {
+  return `### [${time}] ${date} | ID: ${id}\n${content.trim()}\n\n---\n\n`;
 }
 
 function listEntries(sectionContent: string): Array<{ id: string; date: string; time: string; content: string }> {
-  const entryPattern = /### \[([^\]]+)\] (\d{4}-\d{2}-\d{2}) \| ID: ([^\n]+)\n([\s\S]*?)(?:\n---\n|$)/g;
+  const blocks = sectionContent.split(/(?=^### \[[^\]]+\] \d{4}-\d{2}-\d{2} \| ID:)/m);
   const entries: Array<{ id: string; date: string; time: string; content: string }> = [];
-  let match;
-  while ((match = entryPattern.exec(sectionContent)) !== null) {
-    entries.push({
-      time: match[1].trim(),
-      date: match[2].trim(),
-      id: match[3].trim(),
-      content: match[4].trim(),
-    });
+  for (const block of blocks) {
+    const match = block.match(/^### \[([^\]]+)\] (\d{4}-\d{2}-\d{2}) \| ID: ([^\n\r]+)\r?\n([\s\S]*)$/);
+    if (match) {
+      const body = match[4].replace(/\s*---\s*$/, "").trim();
+      entries.push({
+        time: match[1].trim(),
+        date: match[2].trim(),
+        id: match[3].trim(),
+        content: body,
+      });
+    }
   }
   return entries;
 }
 
+function isKnownTarget(target: string): target is keyof typeof FILE_MAP {
+  return Object.prototype.hasOwnProperty.call(FILE_MAP, target);
+}
+
 function resolveTargetFile(target: string | undefined): string {
   if (!target || target === "auto") return SETTINGS_FILE;
-  return FILE_MAP[target] ?? SETTINGS_FILE;
+  return isKnownTarget(target) ? FILE_MAP[target] : SETTINGS_FILE;
 }
 
 function isDuplicateEntry(entries: Array<{ date: string; content: string }>, targetDate: string, newContent: string): boolean {
-  const todayEntries = entries.filter(e => e.date === targetDate);
-  const newSnippet = newContent.trim().slice(0, 60).toLowerCase();
-  return todayEntries.some(e => e.content.slice(0, 60).toLowerCase() === newSnippet);
+  const normalize = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+  const wanted = normalize(newContent);
+  return entries.some(e => e.date === targetDate && normalize(e.content) === wanted);
 }
 
 // ─── SELF-CONTAINED SAFETY LAYER ────────────────────────────────────────────
@@ -254,8 +295,8 @@ export default tool({
       }
       const requested = args.targets
         .split(",")
-        .map(t => t.trim().toLowerCase())
-        .filter(t => t in FILE_MAP);
+        .map((t: string) => t.trim().toLowerCase())
+        .filter((t: string) => isKnownTarget(t));
 
       if (requested.length === 0) {
         return `Error: no valid targets found in '${args.targets}'. Valid: about, goals, settings, projects, bookmark.`;
@@ -304,7 +345,7 @@ export default tool({
         const newEntry = buildEntry(targetDate, entryId, args.content);
         const updatedSection = section.trimEnd() + "\n\n" + newEntry;
         safeWrite(targetFile, before + updatedSection + after);
-        return `Working note created in ${targetName}.md with ID ${entryId}.`;
+        return `Working note created and saved in ${targetName}.md with ID ${entryId}.`;
       } catch (err: any) {
         return `Error: ${err.message}`;
       }
@@ -349,7 +390,7 @@ export default tool({
 
         const escapedId = escapeRegExp(target.id);
         const entryPattern = new RegExp(
-          `(### \\[[^\\]]+\\] \\d{4}-\\d{2}-\\d{2} \\| ID: ${escapedId}\\n)([\\s\\S]*?)(\\n---\\n)`,
+          `^### \\[[^\\]]+\\] ${escapeRegExp(target.date)} \\| ID: ${escapedId}\\n[\\s\\S]*?(?=^### \\[|$)`,
           "m"
         );
 
@@ -359,8 +400,7 @@ export default tool({
 
         const updatedSection = section.replace(
           entryPattern,
-          (_full: string, header: string, _body: string, sep: string) =>
-            `${header}${args.content!.trim()}${sep}`
+          buildEntry(target.date, target.id, args.content, target.time)
         );
 
         safeWrite(targetFile, before + updatedSection + after);
@@ -382,9 +422,13 @@ export default tool({
 
         const escapedId = escapeRegExp(target.id);
         const entryPattern = new RegExp(
-          `### \\[[^\\]]+\\] \\d{4}-\\d{2}-\\d{2} \\| ID: ${escapedId}\\n[\\s\\S]*?\\n---\\n\\n?`,
+          `^### \\[[^\\]]+\\] ${escapeRegExp(target.date)} \\| ID: ${escapedId}\\n[\\s\\S]*?(?=^### \\[|$)`,
           "m"
         );
+
+        if (!entryPattern.test(section)) {
+          return `Error: could not locate entry ${args.id} for deletion in ${targetName}.md.`;
+        }
 
         const updatedSection = section.replace(entryPattern, "");
         safeWrite(targetFile, before + updatedSection + after);

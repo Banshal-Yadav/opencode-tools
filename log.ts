@@ -112,7 +112,12 @@ function hasPendingConfirm(date: string): boolean {
 
 function parseLogEntryLine(line: string, index: number): ParsedLogEntry | null {
   const trimmed = line.trim();
-  if (!trimmed || trimmed.startsWith("# Daily Log")) return null;
+  if (!trimmed || trimmed.startsWith("#")) return null;
+
+  const withDash = line.match(/^-\s*(\d{2}:\d{2}:\d{2})\s*\|\s*ID:\s*([^|]+)\s*\|\s*(.*)$/);
+  if (withDash) {
+    return { index, rawLine: line, time: withDash[1].trim(), id: withDash[2].trim(), content: withDash[3].trim() };
+  }
 
   const withId = line.match(/^\[([^\]]+)\]\s+\|\s+ID:([^|]+)\s+\|\s*(.*)$/);
   if (withId) {
@@ -130,7 +135,7 @@ function parseLogEntryLine(line: string, index: number): ParsedLogEntry | null {
     return { index, rawLine: line, time: timedNoId[1].trim(), id: null, content };
   }
 
-  return { index, rawLine: line, time: null, id: null, content: trimmed };
+  return null;
 }
 
 function collectLogEntries(raw: string): ParsedLogEntry[] {
@@ -343,7 +348,8 @@ export default tool({
           second: "2-digit",
         });
         const entryId = buildEntryId(targetDate);
-        const logEntry = `[${timestamp}] | ID:${entryId} | ${args.content.trim()}\n`;
+        const cleanContent = args.content.replace(/\r?\n/g, " ").trim();
+        const logEntry = `[${timestamp}] | ID:${entryId} | ${cleanContent}\n`;
         ensureFile(logFile, `# Daily Log - ${targetDate}\n\n`);
         fs.appendFileSync(logFile, logEntry, "utf8");
         return `Logged to ${targetDate}.md | ID:${entryId}`;

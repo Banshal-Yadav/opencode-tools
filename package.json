@@ -1,0 +1,14 @@
+{
+  "name": "opencode-tools-verify",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Local verification harness for the OpenCode custom tools. Not part of the shipped tools.",
+    "scripts": {
+      "test": "node verify/run.mjs",
+      "typecheck": "tsc -p tsconfig.build.json"
+    },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}
